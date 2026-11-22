@@ -804,6 +804,7 @@ def main():
     M = Map(MAP, ids)
     MAPREF[0] = M
     IDS[:] = ids
+    ZERO_MS[0] = sum(1 << i for i, s in enumerate(secs) if round(s * 1000) == 0)
     for mi, keys in M.core.get("case_tests", {}).items():
         n = M.conv_index(mi)
         if n is not None:
@@ -838,6 +839,8 @@ def main():
         try:
             p = plans[c]
             out = p["static"] | results.get(c, 0)
+            if out:
+                out |= ZERO_MS[0]  # tests that round to 0 ms cost nothing once a worker exists
             nums = bits_fast(out)
             workers = pack(nums, secs)
         except BaseException:
@@ -1067,6 +1070,7 @@ MAP_INDEX = {}
 MAP_INDEX_ANY = {}
 EXEC = {"common": {}, "tests": 0}
 IDS = []
+ZERO_MS = [0]
 MAPREF = [None]
 
 
@@ -1097,6 +1101,14 @@ def _tpcds_evidence(p, others):
     return sum(1 for n in others if acc >> n & 1)
 CASE_CPU = {}
 CASE_POS = {}
+
+
+def _lpt_loads(nums, secs):
+    """Worker loads (ms) of the best packing of `nums`."""
+    if not nums:
+        return []
+    groups = pack(nums, secs)
+    return [sum(round(secs[n] * 1000) for n in g) for g in groups]
 
 
 def pack_cost(nums, secs):
@@ -1190,6 +1202,22 @@ def verify(plans, dotted, secs, ids):
                 p["static"] |= 1 << cond
                 cond = None
         p["cond"] = cond
+        if cond is None and run and p["static"]:
+            # a candidate that fits under the busiest worker of what is already included costs nothing
+            # to include: include it instead of spending CPU on it
+            loads = _lpt_loads(bits_fast(p["static"]), secs)
+            if loads:
+                top = max(loads)
+                keep = []
+                for n in sorted(run, key=lambda n: -secs[n]):
+                    ms = round(secs[n] * 1000)
+                    i = min(range(len(loads)), key=lambda i: loads[i])
+                    if loads[i] + ms <= top:
+                        loads[i] += ms
+                        p["static"] |= 1 << n
+                    else:
+                        keep.append(n)
+                run = [n for n in run if n in set(keep)]
         if not run and not p.get("import_check"):
             if p.get("cond") is not None:
                 p["static"] |= 1 << p["cond"]
@@ -1207,7 +1235,15 @@ def verify(plans, dotted, secs, ids):
         j.import_check = [m for m, _ in p.get("import_check", [])]
         j.import_paths = {m: path for m, path in p.get("import_check", [])}
         j.filters = {d: f for d, f in filters.items() if d in set(j.tests)}
-        j.stop_on = frozenset(dotted[n] for n in optional) if verify_opt else frozenset()
+        # stop at the first failure only when including the rest then costs less than running it
+        if verify_opt and optional:
+            rest_cpu = sum(est[n] for n in optional)
+            base = bits_fast(p["static"])
+            rest_incl = pack_cost(base + optional, secs) - pack_cost(base, secs)
+            keep_going = cond is None and rest_cpu < 0.5 * rest_incl
+        else:
+            keep_going = False
+        j.stop_on = frozenset(dotted[n] for n in optional) if (verify_opt and not keep_going) else frozenset()
         tpc = {"tests.test_executor.TestExecutor." + m for m in ("test_optimized_tpch", "test_execute_tpch", "test_execute_tpcds")}
         if not any(dotted[n] in tpc for n in run):
             common = EXEC["common"]
