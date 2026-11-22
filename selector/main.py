@@ -1039,13 +1039,20 @@ def analyze(M, patch_path, secs):
             continue
         mi = MAP_INDEX[n]
         mask = 0
+        lazy_hit = False
         for path, s, e in SPANS:
-            tm = M.cases(path).get(mi)
-            if tm:
-                for ln in range(s, e + 1):
+            cf = M.cases(path)
+            tm = cf.get(mi)
+            lz = cf.get("__lazy__", {}).get(mi, ())
+            for ln in range(s, e + 1):
+                if ln in lz:
+                    lazy_hit = True  # a cache-dependent line: later cases may reuse what it computed
+                if tm:
                     v = tm.get(ln)
                     if v:
                         mask |= v
+        if lazy_hit:
+            continue  # run every case
         picked = [keys[i] for i in bits_fast(mask)]
         if n in QSEL:
             picked += [("q", i) for i in sorted(QSEL[n]) if ("q", i) not in picked]

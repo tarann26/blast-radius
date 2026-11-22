@@ -87,6 +87,42 @@ for f, m in rt.items():
         exec_common[f] = set(ls)
 
 refs = refindex.build(REPO)
+# cache-dependent lines: a case test traced again with its cases in reverse order; a line whose set of
+# cases differs between the two orders runs only in whichever case first needs it (lazy set-up, caches)
+REV = os.environ.get("TRACE_REV", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "build", "trace_rev"))
+lazy_by_file = {}
+nrev = 0
+for i, keys in case_tests.items():
+    p = os.path.join(REV, f"{tests[i]['number']}.pkl")
+    if not os.path.exists(p):
+        # no reverse trace: every case line of this test counts as cache-dependent (select all cases)
+        for f, tm in cases_by_file.items():
+            if i in tm:
+                lazy_by_file.setdefault(f, {}).setdefault(i, set()).update(tm[i])
+        continue
+    d = pickle.load(open(p, "rb"))
+    nrev += 1
+    kpos = {k: j for j, k in enumerate(keys)}
+    rev = {}
+    for k, linesd in (d.get("cases") or {}).items():
+        j = kpos.get(k)
+        if j is None:
+            continue
+        for (f, kind), lines in linesd.items():
+            if kind:
+                m = rev.setdefault(f, {})
+                for ln in lines:
+                    m[ln] = m.get(ln, 0) | (1 << j)
+    files = set(rev) | {f for f, tm in cases_by_file.items() if i in tm}
+    for f in files:
+        fw = cases_by_file.get(f, {}).get(i, {})
+        rv = rev.get(f, {})
+        diff = {ln for ln in set(fw) | set(rv) if fw.get(ln, 0) != rv.get(ln, 0)}
+        if diff:
+            lazy_by_file.setdefault(f, {}).setdefault(i, set()).update(diff)
+print("reverse traces", nrev, "of", len(case_tests), "lazy lines", sum(len(s) for tm in lazy_by_file.values() for s in tm.values()))
+for f, tm in lazy_by_file.items():
+    cases_by_file.setdefault(f, {})["__lazy__"] = tm
 os.makedirs(os.path.join(OUT, "rt"), exist_ok=True)
 os.makedirs(os.path.join(OUT, "cases"), exist_ok=True)
 for f, m in rt.items():

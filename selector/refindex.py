@@ -146,6 +146,7 @@ def attr_reads(repo):
 
     for rel, tree in trees.items():
         visit(tree, rel, False, False)
+    _forward(trees, assigned, reads)
     # Reviewed by hand at the pinned commit: these read instance, module or expression attributes,
     # or dispatch *_sql methods, never a class data setting.
     ignore = {
@@ -207,6 +208,38 @@ def module_reads(repo):
         return names
 
     defined = {p: module_names(t) for p, t in trees.items()}
+    # star imports: module path -> source module paths, in order
+    stars = {}
+    explicit = {}  # module path -> {local name: (source path, source name)} for module-level from-imports
+    for p, tree in trees.items():
+        for st in _top_level_imports(tree):
+            if isinstance(st, ast.ImportFrom) and st.module and st.level == 0:
+                src = path_of.get(st.module)
+                if src is None:
+                    continue
+                for a in st.names:
+                    if a.name == "*":
+                        stars.setdefault(p, []).append(src)
+                    elif not path_of.get(f"{st.module}.{a.name}"):
+                        explicit.setdefault(p, {})[a.asname or a.name] = (src, a.name)
+
+    def defines_locally(p, name):
+        return name in defined.get(p, ()) and name not in explicit.get(p, {})
+
+    def resolve(p, name, depth=0):
+        """The module that really defines `name` as seen from module p (follows re-exports)."""
+        if depth > 6:
+            return (p, name)
+        if name in explicit.get(p, {}):
+            sp, sn = explicit[p][name]
+            return resolve(sp, sn, depth + 1)
+        if defines_locally(p, name):
+            return (p, name)
+        for sp in stars.get(p, []):
+            if name in defined.get(sp, ()) or any(name in defined.get(x, ()) for x in stars.get(sp, [])):
+                return resolve(sp, name, depth + 1)
+        return None
+
     for path, tree in trees.items():
         mod = module_of(path)
         # names this module takes from other modules: local alias -> (source path, source name)
@@ -242,12 +275,7 @@ def module_reads(repo):
                 f = in_func or isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
                 ts = top_stmt if top_stmt is not None else (child if node is tree else None)
                 if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
-                    if child.id in defined[path]:
-                        src_key = (path, child.id)
-                    elif child.id in imported:
-                        src_key = imported[child.id]
-                    else:
-                        src_key = None
+                    src_key = resolve(path, child.id)
                     if src_key is not None:
                         e = entry(*src_key)
                         if in_func:
@@ -261,7 +289,8 @@ def module_reads(repo):
                             e["cross"] = True
                 elif isinstance(child, ast.Attribute) and isinstance(child.ctx, ast.Load) and isinstance(child.value, ast.Name) \
                         and child.value.id in aliases:
-                    e = entry(aliases[child.value.id], child.attr)
+                    key = resolve(aliases[child.value.id], child.attr) or (aliases[child.value.id], child.attr)
+                    e = entry(*key)
                     if in_func:
                         e["fn"].append((path, child.lineno))
                     else:
@@ -296,3 +325,52 @@ def _stmt_names(st):
     if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
         names.add(st.name)
     return names
+
+
+def _forward(trees, assigned, reads):
+    """Follow a setting passed unchanged as a keyword argument and stored unchanged on the callee
+    (`Core(x=self.SETTING)` then `self.x = x`): the setting is consumed where `.x` is read, not at
+    the call. Any other use of the parameter stays a read of the setting at that line."""
+    parents = {}
+    funcs_by_param = {}
+    attr_loads = {}
+    for rel, tree in trees.items():
+        for node in ast.walk(tree):
+            for child in ast.iter_child_nodes(node):
+                parents[id(child)] = node
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for a in node.args.args + node.args.kwonlyargs:
+                    funcs_by_param.setdefault(a.arg, []).append((rel, node))
+            if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
+                attr_loads.setdefault(node.attr, []).append((rel, node.lineno))
+    for rel, tree in trees.items():
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Attribute) and node.attr in assigned and isinstance(node.ctx, ast.Load)):
+                continue
+            kw = parents.get(id(node))
+            if not (isinstance(kw, ast.keyword) and kw.arg and kw.value is node):
+                continue
+            callees = funcs_by_param.get(kw.arg, [])
+            if not callees or len(callees) > 3:
+                continue
+            consumed = []
+            ok = True
+            for frel, fn in callees:
+                for sub in ast.walk(fn):
+                    if isinstance(sub, ast.Name) and sub.id == kw.arg and isinstance(sub.ctx, ast.Load):
+                        par = parents.get(id(sub))
+                        if (isinstance(par, ast.Assign) and par.value is sub and len(par.targets) == 1
+                                and isinstance(par.targets[0], ast.Attribute)
+                                and isinstance(par.targets[0].value, ast.Name) and par.targets[0].value.id == "self"):
+                            stored = par.targets[0].attr
+                            consumed.extend(attr_loads.get(stored, []))
+                        else:
+                            consumed.append((frel, sub.lineno))
+            if not ok:
+                continue
+            lst = reads.get(node.attr, [])
+            site = (rel, node.lineno)
+            if site in lst:
+                lst = [s for s in lst if s != site]  # the call only passes the value on
+            reads[node.attr] = lst + consumed
+

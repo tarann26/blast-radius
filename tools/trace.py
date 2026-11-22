@@ -92,6 +92,7 @@ def _main():
         mon.set_events(tool, mon.events.LINE | mon.events.PY_START)
         import syncpool
         syncpool.install()
+        REVERSE = [None]  # number of TPC queries when they run in reverse order
         cases = {}       # case key -> lines dict
         last_case = [None]
         titles = {}
@@ -114,6 +115,8 @@ def _main():
             if meth_name in ("test_execute_tpch", "test_execute_tpcds"):
                 k = submit.count
                 submit.count += 1
+                if REVERSE[0] is not None:
+                    k = REVERSE[0] - 1 - k  # queries ran last-to-first: report the original index
                 key = ("q", k)
             elif last_case[0] is not None:
                 key = ("p",) + last_case[0]
@@ -140,6 +143,8 @@ def _main():
                 elif m.startswith("tpc-h ") or m.startswith("tpc-ds "):
                     try:
                         key = ("q", int(m.split(" ")[1]) - 1)
+                        if REVERSE[0] is not None:
+                            key = ("q", REVERSE[0] - 1 - key[1])
                     except ValueError:
                         key = None
             with orig_subtest(self, msg, **params):
@@ -155,7 +160,10 @@ def _main():
 
         def wrap_pairs(orig):
             def pairs(filename):
-                for idx, item in enumerate(orig(filename)):
+                items = list(enumerate(orig(filename)))
+                if os.environ.get("TRACE_REVERSE"):
+                    items.reverse()  # same cases, last first: cache effects show up in other cases
+                for idx, item in items:
                     meta, sql, expected = item
                     last_case[0] = (filename, idx)
                     titles[meta.get("title") or f"{idx + 1}, {sql}"] = ("p", filename, idx)
@@ -170,6 +178,17 @@ def _main():
             mod = importlib.import_module(modname)
             if modname == "tests.test_optimizer" and hasattr(mod, "load_sql_fixture_pairs"):
                 mod.load_sql_fixture_pairs = wrap_pairs(mod.load_sql_fixture_pairs)
+            if modname == "tests.test_executor" and os.environ.get("TRACE_REVERSE") and meth in ("test_execute_tpch", "test_execute_tpcds"):
+                orig_lp = mod.load_sql_fixture_pairs
+                want = "tpc-h" if meth == "test_execute_tpch" else "tpc-ds"
+
+                def rev_pairs(filename, _orig=orig_lp, _want=want):
+                    items = list(_orig(filename))
+                    if _want in filename:
+                        REVERSE[0] = len(items)
+                        items.reverse()
+                    return iter(items)
+                mod.load_sql_fixture_pairs = rev_pairs
             case = getattr(mod, cls)(meth)
             result = unittest.TestResult()
             suite = unittest.TestSuite([case])
