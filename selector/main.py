@@ -1156,7 +1156,10 @@ def verify(plans, dotted, secs, ids):
         cond = None
         if TPCDS[0] is not None and TPCDS[0] in optional and os.environ.get("BR_TPCDS_RULE", "1") == "1":
             others = [n for n in nums if n != TPCDS[0]]
-            if len(others) >= 3 and _tpcds_evidence(p, others) >= 3 and sum(est[n] for n in others) < 30:
+            base = bits_fast(p["static"])
+            # worth it only when running the others costs well under what leaving TPC-DS out saves
+            saving = pack_cost(base + others + [TPCDS[0]], secs) - pack_cost(base, secs)
+            if len(others) >= 3 and _tpcds_evidence(p, others) >= 3 and sum(est[n] for n in others) < 0.5 * saving:
                 cond = TPCDS[0]
                 optional.remove(cond)
         # likely failures first: tests reached through a hit fixture case or named after the changed module
@@ -1172,7 +1175,9 @@ def verify(plans, dotted, secs, ids):
         if cond is not None and p["changes"] is not None and VERIFY:
             verify_opt = bool(optional) or bool(forced)  # running the others may save the 21 s test
         elif optional and p["changes"] is not None and VERIFY:
-            s_opt = pack_cost(optional, secs)
+            base = bits_fast(p["static"])
+            # what including them adds to what is already included (a long static test leaves slack)
+            s_opt = pack_cost(base + optional, secs) - pack_cost(base, secs)
             c1 = est[optional[0]]
             lhs = sum(est[n] for n in optional) + ovh + ((1 - q) / max(q, 0.01)) * (c1 + ovh)
             verify_opt = lhs < s_opt
