@@ -79,6 +79,7 @@ class _Result(unittest.TestResult):
         _CUR[0] = self.filters.get(k)
         _CUR[1] = 0
         t = self.timeouts.get(k, 10.0)
+        os.write(self.wfd, (json.dumps(["start", k]) + "\n").encode())
         signal.setitimer(signal.ITIMER_REAL, t)
 
     def stopTest(self, test):
@@ -109,7 +110,7 @@ class _Result(unittest.TestResult):
         self.bad.add(self._key(test))
 
 
-def _child(root, plan, timeouts, wfd, filters, skip_tpc):
+def _child(root, plan, timeouts, wfd, filters, skip_tpc, import_check=()):
     """plan: list of (module, [(class, [methods])])."""
     devnull = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull, 1)
@@ -123,6 +124,12 @@ def _child(root, plan, timeouts, wfd, filters, skip_tpc):
 
     syncpool.install()
     _install_filters()
+    for modname in import_check:
+        try:
+            importlib.import_module(modname)
+            os.write(wfd, (json.dumps(["impok", modname]) + "\n").encode())
+        except BaseException:
+            os.write(wfd, (json.dumps(["impfail", modname]) + "\n").encode())
     import resource
     def _cpu():
         r = resource.getrusage(resource.RUSAGE_SELF)
@@ -170,7 +177,11 @@ class Job:
         self.ended = False
         self.deadline = None
         self.imports = []
+        self.running = None
         self.times = {}
+        self.import_check = []
+        self.import_ok = set()
+        self.impfail = set()
         self.cpu = None
         self.wall = None
 
@@ -210,7 +221,7 @@ class Job:
         if pid == 0:
             try:
                 os.close(r)
-                _child(self.root, self.plan(), self.timeouts, w, self.child_filters(), self.skip_tpc)
+                _child(self.root, self.plan(), self.timeouts, w, self.child_filters(), self.skip_tpc, self.import_check)
             finally:
                 os._exit(0)
         os.close(w)
@@ -223,7 +234,10 @@ class Job:
             line, self.buf = self.buf.split(b"\n", 1)
             msg = json.loads(line)
             kind = msg[0]
-            if kind == "done":
+            if kind == "start":
+                self.running = (msg[1], time.monotonic())
+            elif kind == "done":
+                self.running = None
                 self.done[msg[1]] = msg[2]
                 if len(msg) > 3:
                     self.times[msg[1]] = msg[3]
@@ -245,6 +259,10 @@ class Job:
                 for t in self.tests:
                     if t.startswith(inner + ".") and (late or t not in self.done):
                         self.done[t] = True
+            elif kind == "impok":
+                self.import_ok.add(msg[1])
+            elif kind == "impfail":
+                self.impfail.add(msg[1])
             elif kind == "import":
                 self.imports.append((msg[1], msg[2]))
             elif kind == "end":
@@ -255,17 +273,31 @@ class Job:
         return {t for t in self.tests if self.done.get(t, True)}
 
 
-def run_jobs(jobs, parallel=2):
-    """Run jobs, at most `parallel` at once. Each job ends at its budget."""
+def _stuck(j, now):
+    """The running test has overstayed its own limit (a loop the alarm cannot interrupt)."""
+    if j.running is None:
+        return False
+    name, since = j.running
+    return now - since > j.timeouts.get(name, 10.0) + 1.5
+
+
+def run_jobs(jobs, parallel=2, deadline=None):
+    """Run jobs, at most `parallel` at once. Each job ends at its budget, when a test hangs,
+    or at the global deadline; jobs not started by the deadline never start (their tests count as failing)."""
     pending = list(jobs)
     active = {}
     while pending or active:
         while pending and len(active) < parallel:
+            if deadline is not None and time.monotonic() > deadline:
+                pending = []
+                break
             j = pending.pop(0)
             j.start()
             active[j.rfd] = j
+        if not active:
+            break
         now = time.monotonic()
-        timeout = max(0.0, min(j.deadline for j in active.values()) - now)
+        timeout = max(0.0, min(min(j.deadline for j in active.values()) - now, 0.5))
         ready, _, _ = select.select(list(active), [], [], timeout)
         for fd in ready:
             j = active[fd]
@@ -284,7 +316,7 @@ def run_jobs(jobs, parallel=2):
                 del active[fd]
         now = time.monotonic()
         for fd, j in list(active.items()):
-            if now >= j.deadline:
+            if now >= j.deadline or _stuck(j, now) or (deadline is not None and now > deadline):
                 try:
                     os.kill(j.pid, signal.SIGKILL)
                 except ProcessLookupError:

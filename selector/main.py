@@ -282,6 +282,24 @@ def _bound_names(stmt):
     return names
 
 
+_PLAIN_BASES_SKIP = {"NamedTuple", "TypedDict", "Enum", "IntEnum", "StrEnum", "Flag", "IntFlag", "Protocol"}
+
+
+def _narrowable(stmt, cls_node, names, defreads):
+    """A data setting in a plain class whose value only matters where code reads it by name."""
+    if not names or not isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+        return False
+    if cls_node.decorator_list or cls_node.keywords:
+        return False
+    for b in cls_node.bases:
+        bname = b.attr if isinstance(b, ast.Attribute) else b.id if isinstance(b, ast.Name) else None
+        if bname in _PLAIN_BASES_SKIP:
+            return False
+    if stmt not in cls_node.body:
+        return False
+    return not any(n in defreads for n in names) and not any(n.startswith("__") for n in names)
+
+
 def _rt_span(rt, s, e):
     acc = 0
     for ln in range(s, e + 1):
@@ -300,7 +318,7 @@ def scope_impact(M, path, old_text, new_text, hunks):
     old_tree = _parse(old_text)
     new_tree = _parse(new_text)
     if new_tree is None:
-        return 0, imp | M.spawn(), "syntax error"
+        return 0, imp | M.spawn() | M.opens(path), "syntax error"
     if old_tree is None:
         return M.all, 0, "unparsable original"
     if _same_code(old_tree, new_tree, old_text.split("\n"), new_text.split("\n")):
@@ -308,6 +326,8 @@ def scope_impact(M, path, old_text, new_text, hunks):
     mod = path[:-3].replace("/", ".")
     if mod.endswith(".__init__"):
         mod = mod[: -len(".__init__")]
+    readers = M.opens(path)  # tests that read this source as text
+    FULL[0] |= readers
     old_scopes, new_scopes = _scopes(old_tree), _scopes(new_tree)
     old_by_q = {q: (s, e, n) for q, s, e, n in old_scopes}
     new_by_q = {q: (s, e, n) for q, s, e, n in new_scopes}
@@ -392,14 +412,24 @@ def scope_impact(M, path, old_text, new_text, hunks):
                     SPANS.append((ref[1], ref[2], ref[3]))
                 elif ref[0] == "module":
                     acc |= importers_raw.get(ref[1], 0)
+        if _narrowable(stmt, cls[4], names, M.core.get("defreads", ())):
+            reach = M.core.get("generic_bits", 0)
+            for name in names:
+                reach |= M.core.get("attr_bits", {}).get(name, 0)
+            acc &= reach
+            notes.append(f"class {cls[0]} setting {','.join(sorted(names))}")
+        else:
+            notes.append(f"class {cls[0]}")
         deft |= M.conv(acc)
-        notes.append(f"class {cls[0]}")
     if path in M.core.get("import_modules", ()):
         irt = M.core.get("import_rt", {}).get(path, ())
         if deftime or any(s <= ln <= e for ln in irt for (pp, s, e) in SPANS if pp == path):
             deft |= M.spawn()
     cand |= deft
     FULL[0] |= deft
+    if deftime:
+        IMPORT_CHECK.append((mod, path))
+    cand |= readers
     note = f"{len(touched)} functions" + (("; " + ", ".join(sorted(set(notes)))) if notes else "")
     return cand, 0, note
 
@@ -429,6 +459,7 @@ def main():
     secs = [t["seconds"] for t in tests]
     dotted = [_dotted(t["id"]) for t in tests]
     M = Map(MAP, ids)
+    MAPREF[0] = M
     for mi, keys in M.core.get("case_tests", {}).items():
         n = M.conv_index(mi)
         if n is not None:
@@ -465,6 +496,7 @@ def _dotted(tid):
 
 SPANS = []
 FULL = [0]
+IMPORT_CHECK = []  # (dotted module, path) whose definitions changed: import them before any test
 
 
 def _filter_comments(s):
@@ -497,6 +529,7 @@ def fixture_pairs(text):
 
 def analyze(M, patch_path, secs):
     del SPANS[:]
+    del IMPORT_CHECK[:]
     FULL[0] = 0
     with open(patch_path, "rb") as fh:
         text = fh.read().decode("utf-8", "surrogateescape")
@@ -584,12 +617,13 @@ def analyze(M, patch_path, secs):
         select[n] = {"keys": [keys[i] for i in bits_fast(mask)], "content": content.get(n, set())}
     fixture_only = all(not (p.endswith(".py")) for p in changes) and bool(changes)
     return {"fixture_only": fixture_only, "static": static, "verify": cand, "changes": changes, "note": "; ".join(notes), "select": select,
-            "spans": list(SPANS), "full": FULL[0]}
+            "spans": list(SPANS), "full": FULL[0], "import_check": list(IMPORT_CHECK)}
 
 
 CASE_KEYS = {}
 MAP_INDEX = {}
 EXEC = {"common": {}, "tests": 0}
+MAPREF = [None]
 
 
 ALPHA = float(os.environ.get("BR_ALPHA", "2.0"))   # scorer CPU seconds per second measured here
@@ -622,7 +656,7 @@ def verify(plans, dotted, secs, ids):
     jobs = []
     for c, p in plans.items():
         v = p["verify"]
-        if not v:
+        if not v and not p.get("import_check"):
             continue
         nums = bits_fast(v)
         est, filters = {}, {}
@@ -664,10 +698,12 @@ def verify(plans, dotted, secs, ids):
             c1 = est[optional[0]]
             lhs = sum(est[n] for n in optional) + ovh + ((1 - q) / max(q, 0.01)) * (c1 + ovh)
             verify_opt = lhs < s_opt
+        if os.environ.get("BR_EXACT") == "1":  # experiments: run every candidate, never stop early
+            forced, optional, verify_opt = forced + optional, [], False
         run = sorted(forced, key=lambda n: est[n]) + (optional if verify_opt else [])
         if not verify_opt:
             p["static"] |= sum(1 << n for n in optional)
-        if not run:
+        if not run and not p.get("import_check"):
             continue
         if not VERIFY or p["changes"] is None:
             p["static"] |= sum(1 << n for n in run)
@@ -681,7 +717,10 @@ def verify(plans, dotted, secs, ids):
             continue
         timeouts = {dotted[n]: max(3.0, 5 * secs[n] + 2) for n in run}
         budget = 10 + sum(timeouts.values())
-        j = runner.Job(c, root, [dotted[n] for n in run], timeouts, min(budget, 90))
+        cap = 600 if os.environ.get("BR_EXACT") == "1" else 90
+        j = runner.Job(c, root, [dotted[n] for n in run], timeouts, min(budget, cap))
+        j.import_check = [m for m, _ in p.get("import_check", [])]
+        j.import_paths = {m: path for m, path in p.get("import_check", [])}
         j.filters = {d: f for d, f in filters.items() if d in set(j.tests)}
         j.stop_on = frozenset(dotted[n] for n in optional) if verify_opt else frozenset()
         tpc = {"tests.test_executor.TestExecutor." + m for m in ("test_optimized_tpch", "test_execute_tpch", "test_execute_tpcds")}
@@ -698,11 +737,21 @@ def verify(plans, dotted, secs, ids):
             except Exception:
                 pass
     if jobs:
-        runner.run_jobs(jobs, parallel=2)
+        # stay well inside the batch limit (3 minutes; 4.5 in the final with ~1.5x commits)
+        limit = float(os.environ.get("BR_WALL", "150"))
+        runner.run_jobs(jobs, parallel=2, deadline=T0 + limit)
     back = {d: i for i, d in enumerate(dotted)}
     for j in jobs:
         bad = j.failing()
         results[j.key] = sum(1 << back[d] for d in bad if d in back)
+        if j.impfail or (j.import_check and not j.import_ok and not j.ended):
+            # a changed module did not import (or the check never finished): every importer fails
+            extra = 0
+            for m in j.import_check:
+                if m in j.impfail or m not in j.import_ok:
+                    extra |= MAPREF[0].importers(j.import_paths[m]) | MAPREF[0].spawn()
+            results[j.key] |= extra
+            log(f"{j.key}: import check failed for {sorted(j.impfail) or 'unfinished'}; including importers")
         overlay.remove(j.root)
         imp = sum(c for _, c in j.imports)
         nf = sum(1 for d in j.tests if d in j.filters)
@@ -710,6 +759,8 @@ def verify(plans, dotted, secs, ids):
         if os.environ.get("BR_DEBUG"):
             top = sorted(j.times.items(), key=lambda kv: -kv[1])[:5]
             log(f"   slowest: {[(k.rsplit('.', 1)[-1], v) for k, v in top]}")
+        if j.cpu is None:
+            j.cpu = 0.0
         log(f"{j.key}: ran {done}/{len(j.tests)} ({nf} filtered{', stopped' if j.stop_now else ''}), failing {len(bad)}, cpu {j.cpu:.2f}s (imports {imp:.2f}s)")
     return results
 
