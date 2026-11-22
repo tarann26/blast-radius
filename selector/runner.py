@@ -35,13 +35,16 @@ def _install_filters():
 def _wrap_pairs(orig):
     def pairs(filename):
         f = _CUR[0]
+        n_yielded = 0
         for idx, item in enumerate(orig(filename)):
             if f is None or f.get("p") is None:
                 yield item
                 continue
             meta, sql, expected = item
             if (filename, idx) in f["p"] or (tuple(sorted(meta.items())), sql, expected) in f["content"]:
+                n_yielded += 1
                 yield item
+    pairs._br_wrapped = True
     return pairs
 
 
@@ -142,8 +145,9 @@ def _child(root, plan, timeouts, wfd, filters, skip_tpc, import_check=()):
             os.write(wfd, (json.dumps(["module", modname]) + "\n").encode())
             continue
         os.write(wfd, (json.dumps(["import", modname, round(_cpu() - c0, 3)]) + "\n").encode())
-        if modname == "tests.test_optimizer" and hasattr(mod, "load_sql_fixture_pairs"):
-            mod.load_sql_fixture_pairs = _wrap_pairs(mod.load_sql_fixture_pairs)
+        if (modname == "tests.test_optimizer" and hasattr(mod, "load_sql_fixture_pairs")
+                and not getattr(mod.load_sql_fixture_pairs, "_br_wrapped", False)):
+            mod.load_sql_fixture_pairs = _wrap_pairs(mod.load_sql_fixture_pairs)  # once: a second wrap renumbers cases
         if modname == "tests.test_executor" and skip_tpc:
             mod.TPCH_SCHEMA = {}
             mod.TPCDS_SCHEMA = {}

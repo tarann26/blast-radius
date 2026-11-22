@@ -920,6 +920,8 @@ def verify(plans, dotted, secs, ids):
         imp = sum(c for _, c in j.imports)
         nf = sum(1 for d in j.tests if d in j.filters)
         done = sum(1 for d in j.tests if d in j.done)
+        if os.environ.get("BR_DEBUG_ORDER"):
+            log(f"   order {j.key}: " + " | ".join(f"{d.rsplit('.', 1)[-1]}={'F' if j.done.get(d) else 'p' if d in j.done else '-'}" for d in j.tests))
         if os.environ.get("BR_DEBUG"):
             top = sorted(j.times.items(), key=lambda kv: -kv[1])[:5]
             log(f"   slowest: {[(k.rsplit('.', 1)[-1], v) for k, v in top]}")
