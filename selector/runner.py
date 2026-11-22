@@ -137,6 +137,7 @@ def _child(root, plan, timeouts, wfd, filters, skip_tpc, import_check=()):
     def _cpu():
         r = resource.getrusage(resource.RUSAGE_SELF)
         return r.ru_utime + r.ru_stime
+    import gc
     for modname, classes in plan:
         c0 = _cpu()
         try:
@@ -145,6 +146,7 @@ def _child(root, plan, timeouts, wfd, filters, skip_tpc, import_check=()):
             os.write(wfd, (json.dumps(["module", modname]) + "\n").encode())
             continue
         os.write(wfd, (json.dumps(["import", modname, round(_cpu() - c0, 3)]) + "\n").encode())
+        gc.freeze()  # imported objects are permanent: collections inside tests stay cheap
         if (modname == "tests.test_optimizer" and hasattr(mod, "load_sql_fixture_pairs")
                 and not getattr(mod.load_sql_fixture_pairs, "_br_wrapped", False)):
             mod.load_sql_fixture_pairs = _wrap_pairs(mod.load_sql_fixture_pairs)  # once: a second wrap renumbers cases

@@ -166,3 +166,133 @@ def attr_reads(repo):
             kind = "sql"
         out.append((rel, ln, kind))
     return reads, out, defreads
+
+
+def module_reads(repo):
+    """Readers of module-level names.
+
+    Returns {(module path, name): {"fn": [(file, line)], "local": [names in the same module whose
+    module-level definitions read it], "cross": bool (read at definition time in another module),
+    "importers": [paths of modules that `from <module> import name`]}}.
+    """
+    trees = {}
+    for top in ("sqlglot", "tests"):  # test modules import sqlglot names too; their import failing fails their tests
+        for dirpath, dirnames, filenames in os.walk(os.path.join(repo, top)):
+            dirnames[:] = [d for d in dirnames if d not in ("__pycache__", "fixtures")]
+            for fn in filenames:
+                if fn.endswith(".py"):
+                    full = os.path.join(dirpath, fn)
+                    try:
+                        trees[os.path.relpath(full, repo)] = ast.parse(open(full, "rb").read())
+                    except SyntaxError:
+                        pass
+    path_of = {module_of(p): p for p in trees}
+    out = {}
+
+    def entry(path, name):
+        return out.setdefault((path, name), {"fn": [], "local": [], "cross": False, "importers": []})
+
+    def module_names(tree):
+        names = set()
+        for st in tree.body:
+            for tg in (st.targets if isinstance(st, ast.Assign) else [st.target] if isinstance(st, (ast.AnnAssign, ast.AugAssign)) else []):
+                for n in ast.walk(tg):
+                    if isinstance(n, ast.Name):
+                        names.add(n.id)
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(st.name)
+            if isinstance(st, (ast.Import, ast.ImportFrom)):
+                for a in st.names:
+                    names.add((a.asname or a.name).split(".")[0])
+        return names
+
+    defined = {p: module_names(t) for p, t in trees.items()}
+    for path, tree in trees.items():
+        mod = module_of(path)
+        # names this module takes from other modules: local alias -> (source path, source name)
+        imported = {}
+        aliases = {}  # local module alias -> source path
+        # imports inside functions run when the function runs: a removed name fails there
+        for fnode in ast.walk(tree):
+            if isinstance(fnode, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for st in ast.walk(fnode):
+                    if isinstance(st, ast.ImportFrom) and st.module and st.level == 0:
+                        src = path_of.get(st.module)
+                        for a in st.names:
+                            if src and not path_of.get(f"{st.module}.{a.name}"):
+                                entry(src, a.name)["fn"].append((path, st.lineno))
+        for st in tree.body if False else _top_level_imports(tree):
+            if isinstance(st, ast.ImportFrom) and st.module and st.level == 0:
+                src = path_of.get(st.module)
+                for a in st.names:
+                    sub = path_of.get(f"{st.module}.{a.name}")
+                    if sub:
+                        aliases[a.asname or a.name] = sub
+                    elif src:
+                        imported[a.asname or a.name] = (src, a.name)
+                        entry(src, a.name)["importers"].append(path)
+            elif isinstance(st, ast.Import):
+                for a in st.names:
+                    src = path_of.get(a.name)
+                    if src:
+                        aliases[a.asname or a.name.split(".")[0]] = src
+
+        def visit(node, in_func, top_stmt):
+            for child in ast.iter_child_nodes(node):
+                f = in_func or isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+                ts = top_stmt if top_stmt is not None else (child if node is tree else None)
+                if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
+                    if child.id in defined[path]:
+                        src_key = (path, child.id)
+                    elif child.id in imported:
+                        src_key = imported[child.id]
+                    else:
+                        src_key = None
+                    if src_key is not None:
+                        e = entry(*src_key)
+                        if in_func:
+                            e["fn"].append((path, child.lineno))
+                        elif src_key[0] == path:
+                            if ts is not None:
+                                for nm in _stmt_names(ts):
+                                    if nm != child.id:
+                                        e["local"].append(nm)
+                        else:
+                            e["cross"] = True
+                elif isinstance(child, ast.Attribute) and isinstance(child.ctx, ast.Load) and isinstance(child.value, ast.Name) \
+                        and child.value.id in aliases:
+                    e = entry(aliases[child.value.id], child.attr)
+                    if in_func:
+                        e["fn"].append((path, child.lineno))
+                    else:
+                        e["cross"] = True
+                visit(child, f, ts)
+
+        visit(tree, False, None)
+    return out
+
+
+def _top_level_imports(tree):
+    """Import statements outside any function (module level, class bodies, if/try blocks)."""
+    out = []
+
+    def visit(node):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                continue
+            if isinstance(child, (ast.Import, ast.ImportFrom)):
+                out.append(child)
+            visit(child)
+    visit(tree)
+    return out
+
+
+def _stmt_names(st):
+    names = set()
+    for tg in (st.targets if isinstance(st, ast.Assign) else [st.target] if isinstance(st, (ast.AnnAssign, ast.AugAssign)) else []):
+        for n in ast.walk(tg):
+            if isinstance(n, ast.Name):
+                names.add(n.id)
+    if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        names.add(st.name)
+    return names

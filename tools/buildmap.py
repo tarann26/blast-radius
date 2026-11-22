@@ -127,7 +127,11 @@ generic_all = bits_of([(f, ln) for f, ln, k in generic if k == "all"])
 generic_sql = bits_of([(f, ln) for f, ln, k in generic if k == "sql"])
 attr_bits = {name: bits_of(locs) | (generic_sql if name.endswith("_sql") else 0) for name, locs in reads.items()}
 generic_bits = generic_all
-core = {"attr_bits": attr_bits, "generic_bits": generic_bits, "defreads": defreads, "case_cpu": case_cpu, "import_modules": set(imptrace["modules"]), "import_rt": {f: set(v) for f, v in imptrace["rt"].items()},
+modreads = {}
+for key, e in refindex.module_reads(REPO).items():
+    modreads[key] = {"bits": bits_of(e["fn"]), "local": sorted(set(e["local"])), "cross": e["cross"],
+                     "importers": sorted(set(e["importers"]))}
+core = {"modreads": modreads, "attr_bits": attr_bits, "generic_bits": generic_bits, "defreads": defreads, "case_cpu": case_cpu, "import_modules": set(imptrace["modules"]), "import_rt": {f: set(v) for f, v in imptrace["rt"].items()},
         "inproc": inproc, "ids": ids, "importers": importers, "opens": opens, "spawn": spawn, "lister": lister,
         "classes": classes, "refs": refs, "case_tests": case_tests, "exec_common": exec_common,
         "exec_tests": exec_tests, "rt_files": sorted(rt), "case_files": sorted(cases_by_file)}

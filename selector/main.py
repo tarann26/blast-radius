@@ -114,11 +114,33 @@ class Map:
         return self.conv(self.core.get("lister", 0))
 
 
+_PARSE_CACHE = {}
+
+
 def _parse(text):
+    key = hash(text)
+    hit = _PARSE_CACHE.get(key)
+    if hit is not None and hit[0] == text:
+        return hit[1]
     try:
-        return ast.parse(text.encode("utf-8", "surrogateescape"))
+        tree = ast.parse(text.encode("utf-8", "surrogateescape"))
     except (SyntaxError, ValueError):
-        return None
+        tree = None
+    if len(text) > 20000:
+        _PARSE_CACHE[key] = (text, tree)
+    return tree
+
+
+_SCAN_CACHE = {}
+
+
+def _scan_cached(tree):
+    hit = _SCAN_CACHE.get(id(tree))
+    if hit is not None and hit[0] is tree:
+        return hit[1]
+    res = _scan(tree)
+    _SCAN_CACHE[id(tree)] = (tree, res)
+    return res
 
 
 def _scopes(tree):
@@ -243,12 +265,43 @@ def _same_list(a, b, ol, nl):
     return True
 
 
-def _same_code(old_tree, new_tree, ol, nl):
+def _doc_lines(tree):
+    lines = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            b = node.body
+            if b and isinstance(b[0], ast.Expr) and isinstance(b[0].value, ast.Constant) and isinstance(b[0].value.value, str):
+                lines.update(range(b[0].lineno, b[0].end_lineno + 1))
+    return lines
+
+
+def _same_code(old_tree, new_tree, ol, nl, hunks=None):
     """True when the two modules have the same syntax tree (comments, blank lines and layout aside)."""
     try:
-        return _same_list(old_tree.body, new_tree.body, ol, nl)
+        if _same_list(old_tree.body, new_tree.body, ol, nl):
+            return True
     except Exception:
-        return ast.dump(old_tree) == ast.dump(new_tree)
+        if ast.dump(old_tree) == ast.dump(new_tree):
+            return True
+    # docstrings: no test reads __doc__ and the doctest file collects nothing under pytest
+    if hunks is not None:
+        removed, _ = diffparse.changed_old_lines(hunks)
+        added = diffparse.changed_new_lines(hunks)
+        od, nd = _doc_lines(old_tree), _doc_lines(new_tree)
+        if not (removed <= od and added <= nd):
+            return False
+    return _strip_docs(old_tree) == _strip_docs(new_tree)
+
+
+def _strip_docs(tree):
+    import copy
+    t2 = copy.deepcopy(tree)
+    for node in ast.walk(t2):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            b = node.body
+            if b and isinstance(b[0], ast.Expr) and isinstance(b[0].value, ast.Constant) and isinstance(b[0].value.value, str):
+                b[0] = ast.Expr(value=ast.Constant(value=""))
+    return ast.dump(t2)
 
 
 def _classes(tree):
@@ -292,11 +345,22 @@ def _func_header_at(scopes, line):
 
 
 def _stmt_at(tree, line):
+    """Innermost statement whose span holds the line (descends only into nodes that contain it)."""
     best = None
-    for node in ast.walk(tree):
-        if isinstance(node, ast.stmt) and node.lineno <= line <= (node.end_lineno or node.lineno):
-            if best is None or (node.end_lineno - node.lineno) < (best.end_lineno - best.lineno):
-                best = node
+    stack = [tree]
+    while stack:
+        node = stack.pop()
+        for child in ast.iter_child_nodes(node):
+            ln = getattr(child, "lineno", None)
+            if ln is None:
+                if isinstance(child, (ast.arguments, ast.comprehension, ast.match_case, ast.withitem)) or not isinstance(child, ast.AST):
+                    stack.append(child)
+                continue
+            if ln <= line <= (getattr(child, "end_lineno", None) or ln):
+                if isinstance(child, ast.stmt):
+                    if best is None or (child.end_lineno - child.lineno) <= (best.end_lineno - best.lineno):
+                        best = child
+                stack.append(child)
     return best
 
 
@@ -318,6 +382,60 @@ def _bound_names(stmt):
     return names
 
 
+_REGISTRY_MODULES = {"sqlglot/dialects/__init__.py"}  # lazy dialect registry: order pollution seen
+
+
+def _module_reach(M, path, stmt, old_tree, new_tree):
+    """Tests that can notice a module-level definition change, or None when that cannot be bounded."""
+    if path in _REGISTRY_MODULES or stmt is None:
+        return None
+    if not isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.Import, ast.ImportFrom)):
+        return None
+    names = _bound_names(stmt)
+    if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+        names = {(a.asname or a.name).split(".")[0] for a in stmt.names}
+    if not names or any(n.startswith("__") for n in names):
+        return None
+    reads = M.core.get("modreads", {})
+    new_names = set()
+    for st in new_tree.body:
+        new_names |= _bound_names(st)
+        if isinstance(st, (ast.Import, ast.ImportFrom)):
+            new_names |= {(a.asname or a.name).split(".")[0] for a in st.names}
+    acc, todo, seen = 0, list(names), set()
+    while todo:
+        n = todo.pop()
+        if n in seen:
+            continue
+        seen.add(n)
+        e = reads.get((path, n))
+        if e is None:
+            continue  # nobody reads it
+        if e["cross"]:
+            return None  # copied into another module at import time
+        acc |= e["bits"]
+        todo.extend(e["local"])
+        if n not in new_names:
+            # the name is gone: modules that import it by name fail to import
+            for imp_path in e["importers"]:
+                mod = imp_path[:-3].replace("/", ".")
+                if mod.endswith(".__init__"):
+                    mod = mod[: -len(".__init__")]
+                IMPORT_CHECK.append((mod, imp_path))
+    if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return acc  # the body's own executors are added from its span
+    return acc
+
+
+def _is_enum(cls_node):
+    for b in cls_node.bases:
+        name = b.attr if isinstance(b, ast.Attribute) else b.id if isinstance(b, ast.Name) else ""
+        if name in ("Enum", "IntEnum", "StrEnum", "Flag", "IntFlag", "AutoName"):
+            return True
+    return False
+
+
 _PLAIN_BASES_SKIP = {"NamedTuple", "TypedDict", "Enum", "IntEnum", "StrEnum", "Flag", "IntFlag", "Protocol"}
 
 
@@ -325,8 +443,8 @@ def _narrowable(stmt, cls_node, names, defreads):
     """A data setting in a plain class whose value only matters where code reads it by name."""
     if not names or not isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.FunctionDef, ast.AsyncFunctionDef)):
         return False
-    if cls_node.decorator_list or cls_node.keywords:
-        return False
+    if cls_node.decorator_list or any(k.arg != "metaclass" for k in cls_node.keywords):
+        return False  # a metaclass is fine: its named and generic attribute reads are in the read maps
     for b in cls_node.bases:
         bname = b.attr if isinstance(b, ast.Attribute) else b.id if isinstance(b, ast.Name) else None
         if bname in _PLAIN_BASES_SKIP:
@@ -334,6 +452,110 @@ def _narrowable(stmt, cls_node, names, defreads):
     if stmt not in cls_node.body:
         return False
     return not any(n in defreads for n in names) and not any(n.startswith("__") for n in names)
+
+
+def _line_map_new_to_old(hunks):
+    """Map unchanged new-file lines to old-file lines."""
+    pairs = []  # (new_start, old_start, length) runs of unchanged lines inside and between hunks
+    mapping = {}
+    for os_, ol, ns, nl, body in hunks:
+        o = os_ if ol > 0 else os_ + 1
+        n = ns if nl > 0 else ns + 1
+        for tag, _, _ in body:
+            if tag == " ":
+                mapping[n] = o
+                o += 1
+                n += 1
+            elif tag == "-":
+                o += 1
+            else:
+                n += 1
+    starts = sorted((ns if nl > 0 else ns + 1, os_ if ol > 0 else os_ + 1, ol, nl) for os_, ol, ns, nl, _ in hunks)
+
+    def to_old(n):
+        if n in mapping:
+            return mapping[n]
+        # outside hunks: shift by the net size change of every hunk that ends before n
+        shift = 0
+        for nstart, ostart, ol, nl in starts:
+            if nstart + nl <= n:
+                shift = (ostart + ol) - (nstart + nl)
+            else:
+                break
+        return n + shift
+    return to_old
+
+
+def _blocks(tree):
+    """Every statement list with its owner node: (owner, list)."""
+    out = []
+    for node in ast.walk(tree):
+        for field in ("body", "orelse", "finalbody", "handlers"):
+            seq = getattr(node, field, None)
+            if isinstance(seq, list) and seq and isinstance(seq[0], (ast.stmt, ast.excepthandler)):
+                out.append((node, seq))
+        if isinstance(node, ast.Match):
+            for case in node.cases:
+                out.append((case, case.body))
+    return out
+
+
+def _precise_lines(old_tree, new_tree, hunks, removed, added):
+    """Old-file lines whose executors include every test a change can reach (statement level)."""
+    try:
+        lines = set()
+        # removed or modified lines: the old statement that holds them
+        for L in removed:
+            st = _stmt_at(old_tree, L)
+            if st is None:
+                continue
+            body0 = None
+            for field in ("body", "orelse", "finalbody", "handlers"):
+                seq = getattr(st, field, None)
+                if isinstance(seq, list) and seq:
+                    body0 = seq[0].lineno if body0 is None else min(body0, seq[0].lineno)
+            if body0 is None:  # simple statement: all its lines
+                lines.update(range(st.lineno, (st.end_lineno or st.lineno) + 1))
+            else:  # compound: its header (reached whenever the statement runs)
+                lines.update(range(st.lineno, body0))
+                lines.add(st.lineno)
+        # added lines: tests that reach the insertion point = those that ran the statement before it in
+        # the same block, or the block's owner when it is the first statement
+        to_old = _line_map_new_to_old(hunks)
+        added_set = set(added)
+        blocks = _blocks(new_tree)
+        for L in added:
+            st = _stmt_at(new_tree, L)
+            if st is None:
+                continue
+            owner, seq, idx = None, None, None
+            for ow, sq in blocks:
+                for i, s in enumerate(sq):
+                    if s is st:
+                        owner, seq, idx = ow, sq, i
+                        break
+                if seq is not None:
+                    break
+            if seq is None:
+                return None
+            anchor = None
+            j = idx - 1
+            while j >= 0:
+                prev = seq[j]
+                if not any(ln in added_set for ln in range(prev.lineno, (prev.end_lineno or prev.lineno) + 1)):
+                    anchor = prev.lineno
+                    break
+                j -= 1
+            if anchor is None:
+                if isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.Module, ast.ClassDef)):
+                    return None  # first statement of a function or module: fall back to the whole scope
+                anchor = owner.lineno
+            lines.add(to_old(anchor))
+            # a compound statement added around existing code also reaches what it wraps
+            lines.update(to_old(x) for x in range(st.lineno, (st.end_lineno or st.lineno) + 1) if x not in added_set)
+        return lines
+    except Exception:
+        return None
 
 
 def _rt_span(rt, s, e):
@@ -357,14 +579,14 @@ def scope_impact(M, path, old_text, new_text, hunks):
         return 0, imp | M.spawn() | M.opens(path), "syntax error"
     if old_tree is None:
         return M.all, 0, "unparsable original"
-    if _same_code(old_tree, new_tree, old_text.split("\n"), new_text.split("\n")):
+    if _same_code(old_tree, new_tree, old_text.split("\n"), new_text.split("\n"), hunks):
         return 0, 0, "same code"
     mod = path[:-3].replace("/", ".")
     if mod.endswith(".__init__"):
         mod = mod[: -len(".__init__")]
     readers = M.opens(path)  # tests that read this source as text
     FULL[0] |= readers
-    (old_scopes, old_classes), (new_scopes, new_classes) = _scan(old_tree), _scan(new_tree)
+    (old_scopes, old_classes), (new_scopes, new_classes) = _scan_cached(old_tree), _scan(new_tree)
     old_by_q = {q: (s, e, n) for q, s, e, n in old_scopes}
     new_by_q = {q: (s, e, n) for q, s, e, n in new_scopes}
     removed, _inserted = diffparse.changed_old_lines(hunks)
@@ -428,11 +650,24 @@ def scope_impact(M, path, old_text, new_text, hunks):
         deftime.append(("new", new_by_q[q][2].lineno))
     rt = M.rt(path)
     raw = 0
+    line_level = os.environ.get("BR_LINE_LEVEL", "1") == "1"
+    precise = _precise_lines(old_tree, new_tree, hunks, removed, added) if line_level else None
     for q in touched:
         if q in old_by_q:
-            s, e, _ = old_by_q[q]
-            raw |= _rt_span(rt, s, e)
-            SPANS.append((path, s, e))
+            s, e, onode = old_by_q[q]
+            nn = new_by_q.get(q, (None, None, None))[2]
+            if precise is not None and nn is not None and not _structural(onode, nn):
+                # statement level: only tests that ran a changed statement or reached an insertion point
+                lines = sorted(ln for ln in precise if s <= ln <= e)
+                if not lines:
+                    lines = list(range(s, e + 1))
+            else:
+                lines = list(range(s, e + 1))
+            for ln in lines:
+                b = rt.get(ln)
+                if b:
+                    raw |= b
+                SPANS.append((path, ln, ln))
     cand = M.conv(raw)
     notes = []
     classes_map = M.core.get("classes", {})
@@ -462,6 +697,12 @@ def scope_impact(M, path, old_text, new_text, hunks):
         seen.add(key)
         if os.environ.get("BR_DEBUG_DEFT"):
             log(f"   deftime {side}:{line} class={cls[0] if cls else None} stmt={type(stmt).__name__} names={sorted(names)} fq={fq}")
+        if cls is None:
+            reach = _module_reach(M, path, stmt, old_tree, new_tree)
+            if reach is not None:
+                deft |= M.conv(reach)
+                notes.append(f"module names {','.join(sorted(_bound_names(stmt)))[:60]}")
+                continue
         if cls is None and bin(imp).count("1") * 2 > M.n:
             BROAD[0] = True  # a module-level change most tests import: isolated passes are not trusted
         if cls is None:
@@ -478,6 +719,18 @@ def scope_impact(M, path, old_text, new_text, hunks):
             notes.append("module-level")
             continue
         users = classes_map.get(f"{mod}:{cls[0]}", 0)
+        if not users and _is_enum(cls[4]) and isinstance(stmt, (ast.Assign, ast.AnnAssign)) and stmt in cls[4].body \
+                and names and "." not in cls[0]:
+            # an enum member: code reads it by name (Enum.MEMBER), or reads the enum class itself
+            # (iteration, lookup by value, membership); both are in the read maps
+            e = M.core.get("modreads", {}).get((path, cls[0]))
+            if e is not None and not e["cross"]:
+                reach = e["bits"] | M.core.get("generic_bits", 0)
+                for name in names:
+                    reach |= M.core.get("attr_bits", {}).get(name, 0)
+                deft |= M.conv(reach)
+                notes.append(f"enum {cls[0]} member {','.join(sorted(names))}")
+                continue
         if not users:
             deft |= imp
             if bin(imp).count("1") * 2 > M.n:
@@ -694,10 +947,16 @@ def analyze(M, patch_path, secs):
                         if not tid.startswith("tests/test_executor.py::"):
                             continue
                         if tid.endswith("::" + tpc[rel]) and len(old_cases) == len(new_cases):
-                            QSEL[n] = {i for i in range(len(new_cases)) if old_cases[i] != new_cases[i]}
+                            # the executor test reads only each query's SQL and metadata, never the expected text
+                            QSEL[n] = {i for i in range(len(new_cases))
+                                       if old_cases[i][:2] != new_cases[i][:2]}
                             full &= ~(1 << n)
-                        elif not tid.endswith(("::test_execute_tpch", "::test_execute_tpcds", "::test_optimized_tpch")):
-                            # other executor tests only load the file in class setup, which parsed fine
+                            if not QSEL[n]:
+                                cand &= ~(1 << n)
+                        elif tid.endswith("::test_optimized_tpch") and rel == "optimizer/tpc-h/tpc-h.sql":
+                            pass  # compares against the expected text: stays a full candidate
+                        else:
+                            # loads the file in class setup only (which parsed fine), or reads the other TPC file
                             full &= ~(1 << n)
                             cand &= ~(1 << n)
                 if old_cases is not None and new_cases is not None:
@@ -742,7 +1001,7 @@ IDS = []
 MAPREF = [None]
 
 
-ALPHA = float(os.environ.get("BR_ALPHA", "2.0"))   # scorer CPU seconds per second measured here
+ALPHA = float(os.environ.get("BR_ALPHA", "1.0"))   # scorer CPU seconds per second measured here
 OVH = float(os.environ.get("BR_OVH", "0.3"))       # scorer CPU of one verification child, imports included
 Q_CODE = float(os.environ.get("BR_Q_CODE", "0.35"))  # chance a code change breaks nothing it reaches
 Q_FIXTURE = float(os.environ.get("BR_Q_FIXTURE", "0.05"))
