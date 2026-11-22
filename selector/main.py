@@ -752,6 +752,8 @@ def scope_impact(M, path, old_text, new_text, hunks):
             reach = M.core.get("generic_bits", 0)
             for name in names:
                 reach |= M.core.get("attr_bits", {}).get(name, 0)
+                if name.endswith("_sql"):
+                    reach |= M.core.get("generic_sql", 0)  # generator dispatch finds *_sql methods by name
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 q = f"{cls[0]}.{stmt.name}"
                 if q in old_by_q:  # tests that ran the method as it was
@@ -827,18 +829,59 @@ def main():
         except Exception as e:  # anything unexpected: run nothing risky, include everything
             log(f"{c}: analysis failed ({type(e).__name__}: {e}); including every test")
             plans[c] = {"static": M.all, "verify": 0, "changes": None, "note": "fallback"}
-    results = verify(plans, dotted, secs, ids)
+    try:
+        results = verify(plans, dotted, secs, ids)
+    except BaseException as e:  # never end without answers: include every candidate
+        log(f"verification failed ({type(e).__name__}: {e}); including candidates")
+        results = {c: p.get("verify", 0) for c, p in plans.items()}
     for c in commits:
-        p = plans[c]
-        out = p["static"] | results.get(c, 0)
-        nums = bits_fast(out)
-        print(json.dumps({"commit": c, "workers": pack(nums, secs)}), flush=True)
+        try:
+            p = plans[c]
+            out = p["static"] | results.get(c, 0)
+            nums = bits_fast(out)
+            workers = pack(nums, secs)
+        except BaseException:
+            workers = pack(list(range(len(secs))), secs)
+        print(json.dumps({"commit": c, "workers": workers}), flush=True)
     log(f"done in {time.monotonic()-T0:.1f}s wall, cpu {time.process_time():.1f}s (main only)")
 
 
 def _dotted(tid):
     path, cls, meth = tid.split("::")
     return path[:-3].replace("/", ".") + "." + cls + "." + meth
+
+
+def _tests_under(d):
+    acc = 0
+    for i, tid in enumerate(IDS):
+        if d == "" or tid.startswith(d.rstrip("/") + "/"):
+            acc |= 1 << i
+    return acc
+
+
+def _is_pytest_config(p):
+    return p in ("pyproject.toml", "setup.cfg", "pytest.ini", "tox.ini", "conftest.py", "tests/conftest.py")
+
+
+def _pytest_config_changed(p, old, new):
+    """True when the change can alter how pytest runs every test (broken file or pytest settings)."""
+    if old is None or new is None:
+        return True
+    try:
+        if p == "pyproject.toml":
+            import tomllib
+            o, n = tomllib.loads(old), tomllib.loads(new)
+            return o.get("tool", {}).get("pytest") != n.get("tool", {}).get("pytest")
+        if p in ("setup.cfg", "tox.ini", "pytest.ini"):
+            import configparser
+            co, cn = configparser.ConfigParser(), configparser.ConfigParser()
+            co.read_string(old)
+            cn.read_string(new)
+            secs = ("pytest", "tool:pytest")
+            return any((co.has_section(s) and dict(co[s])) != (cn.has_section(s) and dict(cn[s])) for s in secs)
+    except Exception:
+        return True
+    return True
 
 
 SPANS = []
@@ -896,6 +939,8 @@ def analyze(M, patch_path, secs):
         if fp.binary:
             for p in paths:
                 static |= M.opens(p)
+                if p.endswith(".py"):
+                    static |= M.importers(p) | M.spawn() | M.lister()
             notes.append(f"binary {paths}")
             continue
         if fp.mode_only:
@@ -923,16 +968,33 @@ def analyze(M, patch_path, secs):
                 c, s, note = scope_impact(M, p, text_old, text_new, fp.hunks if old_path == new_path else [])
                 cand |= c
                 static |= s
+                if p.startswith("tests/"):
+                    FULL[0] |= c  # test code can change how cases are loaded or checked: run every case
+                    if os.path.basename(p) == "conftest.py" or (text_old is None and p.endswith("__init__.py")):
+                        static |= _tests_under(os.path.dirname(p))
                 notes.append(f"{p}: {note}")
                 continue
+            if _is_pytest_config(p):
+                broken_or_relevant = _pytest_config_changed(p, text_old, text_new)
+                if broken_or_relevant:
+                    static |= M.all
+                    notes.append(f"{p}: pytest configuration")
+                    continue
             readers = M.opens(p)
             c = readers
-            if text_old is None or text_new is None:
+            if not (p.startswith("sqlglot/") or p.startswith("tests/")):
+                static |= readers  # such tests may resolve the real path and never see the overlay
+                notes.append(f"{p}: outside file")
+                continue
+            if text_new is None:
+                # a deleted file: tests that list or read its folder may notice
                 c |= M.lister()
                 d = os.path.dirname(p)
                 for f, b in M.core["opens"].items():
                     if os.path.dirname(f) == d:
                         c |= M.conv(b)
+            elif text_old is None:
+                c |= M.lister()
             if p.endswith(".py"):
                 c |= M.spawn()
             cand |= c
@@ -1124,18 +1186,12 @@ def verify(plans, dotted, secs, ids):
             p["static"] |= sum(1 << n for n in run)
             continue
         root = os.path.join(TMP, "ov", c)
-        try:
-            overlay.build(REPO, root, p["changes"])
-        except Exception as e:
-            log(f"{c}: overlay failed ({e}); including candidates")
-            p["static"] |= sum(1 << n for n in run)
-            if p.get("cond") is not None:
-                p["static"] |= 1 << p["cond"]
-            continue
         timeouts = {dotted[n]: max(6.0, 8 * secs[n] + 4) for n in run}
         budget = 15 + sum(timeouts.values())
         cap = 600 if os.environ.get("BR_EXACT") == "1" else 120
         j = runner.Job(c, root, [dotted[n] for n in run], timeouts, min(budget, cap))
+        j.prepare = (lambda root=root, changes=p["changes"]: overlay.build(REPO, root, changes))
+        j.cleanup = (lambda root=root: overlay.remove(root))
         j.import_check = [m for m, _ in p.get("import_check", [])]
         j.import_paths = {m: path for m, path in p.get("import_check", [])}
         j.filters = {d: f for d, f in filters.items() if d in set(j.tests)}

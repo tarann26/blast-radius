@@ -56,6 +56,25 @@ def _alarm(signum, frame):
     raise _Timeout("test timed out")
 
 
+def _limit_memory():
+    """Cap the child's address space at its size now plus 1.5 GB (a runaway test fails fast)."""
+    try:
+        import resource
+        size = 0
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmSize:"):
+                    size = int(line.split()[1]) * 1024
+        if size <= 0:
+            return
+        cap = size + 1_500_000_000
+        soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+        if hard == resource.RLIM_INFINITY or hard > cap:
+            resource.setrlimit(resource.RLIMIT_AS, (cap, hard))
+    except Exception:
+        pass
+
+
 class _Result(unittest.TestResult):
     """Collects failing test ids and reports each finished test at once."""
 
@@ -96,6 +115,8 @@ class _Result(unittest.TestResult):
         os.write(self.wfd, (json.dumps(["done", k, k in self.bad, dt]) + "\n").encode())
 
     def addError(self, test, err):
+        if err and err[0] in (_Timeout, MemoryError):
+            os.write(self.wfd, (json.dumps(["timeout", self._key(test)]) + "\n").encode())
         k = self._key(test)
         if k is None:  # setUpClass / setUpModule failure: the holder names the class or module
             os.write(self.wfd, (json.dumps(["fixture", str(test)]) + "\n").encode())
@@ -115,6 +136,12 @@ class _Result(unittest.TestResult):
 
 def _child(root, plan, timeouts, wfd, filters, skip_tpc, import_check=()):
     """plan: list of (module, [(class, [methods])])."""
+    try:
+        os.setpgid(0, 0)  # its own group: a stop kills any process a test started too
+    except OSError:
+        pass
+    if sys.platform.startswith("linux"):
+        _limit_memory()
     devnull = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull, 1)
     os.dup2(devnull, 2)
@@ -221,7 +248,12 @@ class Job:
                 plan.append((mod, [(cls, [meth])]))
         return plan
 
+    prepare = None
+    cleanup = None
+
     def start(self):
+        if self.prepare is not None:
+            self.prepare()
         r, w = os.pipe()
         pid = os.fork()
         if pid == 0:
@@ -265,6 +297,8 @@ class Job:
                 for t in self.tests:
                     if t.startswith(inner + ".") and (late or t not in self.done):
                         self.done[t] = True
+            elif kind == "timeout":
+                self.stop_now = True  # a hang or a memory blow-up: stop and include what is left
             elif kind == "impok":
                 self.import_ok.add(msg[1])
             elif kind == "impfail":
@@ -298,7 +332,11 @@ def run_jobs(jobs, parallel=2, deadline=None):
                 pending = []
                 break
             j = pending.pop(0)
-            j.start()
+            try:
+                j.start()
+            except Exception:
+                j.ended = False  # never ran: every test counts as failing
+                continue
             active[j.rfd] = j
         if not active:
             break
@@ -311,10 +349,7 @@ def run_jobs(jobs, parallel=2, deadline=None):
             if data:
                 j.feed(data)
             if j.stop_now and not j.ended:
-                try:
-                    os.kill(j.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                _kill(j)
                 _finish(j)
                 del active[fd]
             elif not data or j.ended:
@@ -323,15 +358,23 @@ def run_jobs(jobs, parallel=2, deadline=None):
         now = time.monotonic()
         for fd, j in list(active.items()):
             if now >= j.deadline or _stuck(j, now) or (deadline is not None and now > deadline):
-                try:
-                    os.kill(j.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                _kill(j)
                 _finish(j)
                 del active[fd]
 
 
+def _kill(j):
+    for fn in (lambda: os.killpg(j.pid, signal.SIGKILL), lambda: os.kill(j.pid, signal.SIGKILL)):
+        try:
+            fn()
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+
 def _finish(j):
+    if getattr(j, "_finished", False):
+        return
+    j._finished = True
     try:
         os.close(j.rfd)
     except OSError:
@@ -342,3 +385,12 @@ def _finish(j):
     except ChildProcessError:
         j.cpu = None
     j.wall = time.monotonic() - (j.deadline - j.budget)
+    try:
+        os.killpg(j.pid, signal.SIGKILL)  # anything a test left running
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    if j.cleanup is not None:
+        try:
+            j.cleanup()
+        except Exception:
+            pass

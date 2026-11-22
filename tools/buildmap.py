@@ -131,7 +131,7 @@ modreads = {}
 for key, e in refindex.module_reads(REPO).items():
     modreads[key] = {"bits": bits_of(e["fn"]), "local": sorted(set(e["local"])), "cross": e["cross"],
                      "importers": sorted(set(e["importers"]))}
-core = {"modreads": modreads, "attr_bits": attr_bits, "generic_bits": generic_bits, "defreads": defreads, "case_cpu": case_cpu, "import_modules": set(imptrace["modules"]), "import_rt": {f: set(v) for f, v in imptrace["rt"].items()},
+core = {"generic_sql": generic_sql, "modreads": modreads, "attr_bits": attr_bits, "generic_bits": generic_bits, "defreads": defreads, "case_cpu": case_cpu, "import_modules": set(imptrace["modules"]), "import_rt": {f: set(v) for f, v in imptrace["rt"].items()},
         "inproc": inproc, "ids": ids, "importers": importers, "opens": opens, "spawn": spawn, "lister": lister,
         "classes": classes, "refs": refs, "case_tests": case_tests, "exec_common": exec_common,
         "exec_tests": exec_tests, "rt_files": sorted(rt), "case_files": sorted(cases_by_file)}
