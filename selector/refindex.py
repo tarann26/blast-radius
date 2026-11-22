@@ -79,6 +79,8 @@ def attr_reads(repo):
         for node in ast.walk(tree):
             if isinstance(node, ast.ClassDef):
                 for st in node.body:
+                    if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)) and not st.name.startswith("__"):
+                        assigned.add(st.name)
                     tgts = st.targets if isinstance(st, ast.Assign) else [st.target] if isinstance(st, (ast.AnnAssign, ast.AugAssign)) else []
                     for tg in tgts:
                         for n in ast.walk(tg):

@@ -149,6 +149,42 @@ def _scopes(tree):
     return out
 
 
+def _scan(tree):
+    """One pass: function-like scopes (as _scopes) and classes (as _classes)."""
+    scopes, classes = [], []
+    counters = {}
+    FD, AFD, CD, LAM = ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda
+    iter_children = ast.iter_child_nodes
+
+    def visit(node, sprefix, cprefix):
+        for child in iter_children(node):
+            tp = type(child)
+            if tp is FD or tp is AFD:
+                q = f"{sprefix}{child.name}"
+                start = child.body[0].lineno if child.body else child.lineno
+                scopes.append((q, start, child.end_lineno, child))
+                visit(child, q + ".", f"{cprefix}{child.name}.")
+            elif tp is CD:
+                cq = f"{cprefix}{child.name}"
+                hs = min([d.lineno for d in child.decorator_list] + [child.lineno])
+                bs = child.body[0].lineno if child.body else child.lineno
+                classes.append((cq, hs, bs, child.end_lineno, child))
+                visit(child, f"{sprefix}{child.name}.", cq + ".")
+            elif tp is LAM:
+                k = counters.get(sprefix, 0)
+                counters[sprefix] = k + 1
+                q = f"{sprefix}<lambda#{k}>"
+                scopes.append((q, child.body.lineno, child.body.end_lineno, child))
+                visit(child, q + ".", cprefix)
+            elif isinstance(child, (ast.expr_context, ast.operator, ast.cmpop, ast.unaryop, ast.boolop)):
+                continue
+            else:
+                visit(child, sprefix, cprefix)
+
+    visit(tree, "", "")
+    return scopes, classes
+
+
 def _innermost(scopes, line):
     best = None
     for q, s, e, node in scopes:
@@ -287,7 +323,7 @@ _PLAIN_BASES_SKIP = {"NamedTuple", "TypedDict", "Enum", "IntEnum", "StrEnum", "F
 
 def _narrowable(stmt, cls_node, names, defreads):
     """A data setting in a plain class whose value only matters where code reads it by name."""
-    if not names or not isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+    if not names or not isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.FunctionDef, ast.AsyncFunctionDef)):
         return False
     if cls_node.decorator_list or cls_node.keywords:
         return False
@@ -328,10 +364,9 @@ def scope_impact(M, path, old_text, new_text, hunks):
         mod = mod[: -len(".__init__")]
     readers = M.opens(path)  # tests that read this source as text
     FULL[0] |= readers
-    old_scopes, new_scopes = _scopes(old_tree), _scopes(new_tree)
+    (old_scopes, old_classes), (new_scopes, new_classes) = _scan(old_tree), _scan(new_tree)
     old_by_q = {q: (s, e, n) for q, s, e, n in old_scopes}
     new_by_q = {q: (s, e, n) for q, s, e, n in new_scopes}
-    old_classes, new_classes = _classes(old_tree), _classes(new_tree)
     removed, _inserted = diffparse.changed_old_lines(hunks)
     added = diffparse.changed_new_lines(hunks)
     touched = set()   # function scopes whose body changed (qualnames)
@@ -352,15 +387,44 @@ def scope_impact(M, path, old_text, new_text, hunks):
             touched.add(sc[0])
     for q in list(touched):
         if q not in new_by_q:
+            pq = None
+            parts = q.split(".")
+            for i in range(len(parts) - 1, 0, -1):
+                cand_q = ".".join(parts[:i])
+                if cand_q in old_by_q:
+                    pq = cand_q
+                    break
+            if pq is not None:
+                if pq in new_by_q:
+                    touched.add(pq)
+                continue  # the enclosing function changed or vanished: handled with it
             deftime.append(("old", old_by_q[q][2].lineno))
             continue
         on, nn = old_by_q[q][2], new_by_q[q][2]
         if _func_sig(on) != _func_sig(nn):
             deftime.append(("old", on.lineno))
-    # scopes that vanished or appeared change the definitions around them
+    # scopes that vanished or appeared change the definitions around them; a scope nested in a function
+    # only changes that function's code
+    def parent_func(q, by_q):
+        parts = q.split(".")
+        for i in range(len(parts) - 1, 0, -1):
+            pq = ".".join(parts[:i])
+            if pq in by_q:
+                return pq
+        return None
     for q in set(old_by_q) - set(new_by_q):
+        pq = parent_func(q, old_by_q)
+        if pq is not None:
+            if pq in new_by_q:
+                touched.add(pq)
+            continue
         deftime.append(("old", old_by_q[q][2].lineno))
     for q in set(new_by_q) - set(old_by_q):
+        pq = parent_func(q, new_by_q)
+        if pq is not None:
+            if pq in old_by_q:
+                touched.add(pq)
+            continue
         deftime.append(("new", new_by_q[q][2].lineno))
     rt = M.rt(path)
     raw = 0
@@ -385,6 +449,10 @@ def scope_impact(M, path, old_text, new_text, hunks):
             SPANS.append((path, s, e))
         cls = _class_at(classes, line)
         stmt = _stmt_at(tree, line)
+        if isinstance(stmt, ast.ClassDef) and line >= (stmt.body[0].lineno if stmt.body else stmt.lineno) and fq is None:
+            continue  # a blank or comment line between statements of a class body: no effect by itself
+        if stmt is None and fq is None:
+            continue  # a blank or comment line at module level
         names = _bound_names(stmt)
         if fq:
             names.add(fq.split(".")[-1])
@@ -392,13 +460,28 @@ def scope_impact(M, path, old_text, new_text, hunks):
         if key in seen:
             continue
         seen.add(key)
+        if os.environ.get("BR_DEBUG_DEFT"):
+            log(f"   deftime {side}:{line} class={cls[0] if cls else None} stmt={type(stmt).__name__} names={sorted(names)} fq={fq}")
+        if cls is None and bin(imp).count("1") * 2 > M.n:
+            BROAD[0] = True  # a module-level change most tests import: isolated passes are not trusted
         if cls is None:
+            if (isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and stmt.name in old_by_q
+                    and stmt.name in new_by_q):
+                # a module-level function that still exists changed its signature or decorators:
+                # only code that runs it can notice (its body span is already in)
+                s, e, _ = old_by_q[stmt.name]
+                cand |= M.conv(_rt_span(rt, s, e))
+                SPANS.append((path, s, e))
+                notes.append(f"function {stmt.name} header")
+                continue
             deft |= imp
             notes.append("module-level")
             continue
         users = classes_map.get(f"{mod}:{cls[0]}", 0)
         if not users:
             deft |= imp
+            if bin(imp).count("1") * 2 > M.n:
+                BROAD[0] = True
             notes.append(f"class {cls[0]} (no instances)")
             continue
         acc = users
@@ -416,6 +499,11 @@ def scope_impact(M, path, old_text, new_text, hunks):
             reach = M.core.get("generic_bits", 0)
             for name in names:
                 reach |= M.core.get("attr_bits", {}).get(name, 0)
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                q = f"{cls[0]}.{stmt.name}"
+                if q in old_by_q:  # tests that ran the method as it was
+                    s, e, _ = old_by_q[q]
+                    reach |= _rt_span(rt, s, e)
             acc &= reach
             notes.append(f"class {cls[0]} setting {','.join(sorted(names))}")
         else:
@@ -460,12 +548,18 @@ def main():
     dotted = [_dotted(t["id"]) for t in tests]
     M = Map(MAP, ids)
     MAPREF[0] = M
+    IDS[:] = ids
     for mi, keys in M.core.get("case_tests", {}).items():
         n = M.conv_index(mi)
         if n is not None:
             CASE_KEYS[n] = keys
             MAP_INDEX[n] = mi
     INPROC.update(M.core.get("inproc", {}))
+    tid = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+    if tid in ids:
+        TPCDS[0] = ids.index(tid)
+        mi = M.core["ids"].index(tid) if tid in M.core["ids"] else None
+        MAP_INDEX_ANY[TPCDS[0]] = mi
     CASE_CPU.update(M.core.get("case_cpu", {}))
     for n, keys in CASE_KEYS.items():
         CASE_POS[n] = {k: j for j, k in enumerate(keys)}
@@ -497,6 +591,8 @@ def _dotted(tid):
 SPANS = []
 FULL = [0]
 IMPORT_CHECK = []  # (dotted module, path) whose definitions changed: import them before any test
+BROAD = [False]
+QSEL = {}  # test number -> TPC query indices whose fixture text changed
 
 
 def _filter_comments(s):
@@ -530,6 +626,8 @@ def fixture_pairs(text):
 def analyze(M, patch_path, secs):
     del SPANS[:]
     del IMPORT_CHECK[:]
+    BROAD[0] = False
+    QSEL.clear()
     FULL[0] = 0
     with open(patch_path, "rb") as fh:
         text = fh.read().decode("utf-8", "surrogateescape")
@@ -589,6 +687,19 @@ def analyze(M, patch_path, secs):
             if p.startswith("tests/fixtures/") and text_old is not None and text_new is not None:
                 old_cases, new_cases = fixture_pairs(text_old), fixture_pairs(text_new)
                 rel = p[len("tests/fixtures/"):]
+                tpc = {"optimizer/tpc-h/tpc-h.sql": "test_execute_tpch", "optimizer/tpc-ds/tpc-ds.sql": "test_execute_tpcds"}
+                if rel in tpc and old_cases is not None and new_cases is not None:
+                    for n in bits_fast(readers):
+                        tid = IDS[n]
+                        if not tid.startswith("tests/test_executor.py::"):
+                            continue
+                        if tid.endswith("::" + tpc[rel]) and len(old_cases) == len(new_cases):
+                            QSEL[n] = {i for i in range(len(new_cases)) if old_cases[i] != new_cases[i]}
+                            full &= ~(1 << n)
+                        elif not tid.endswith(("::test_execute_tpch", "::test_execute_tpcds", "::test_optimized_tpch")):
+                            # other executor tests only load the file in class setup, which parsed fine
+                            full &= ~(1 << n)
+                            cand &= ~(1 << n)
                 if old_cases is not None and new_cases is not None:
                     changed = set(new_cases) - set(old_cases)
                     for n in bits_fast(readers):
@@ -614,15 +725,20 @@ def analyze(M, patch_path, secs):
                     v = tm.get(ln)
                     if v:
                         mask |= v
-        select[n] = {"keys": [keys[i] for i in bits_fast(mask)], "content": content.get(n, set())}
+        picked = [keys[i] for i in bits_fast(mask)]
+        if n in QSEL:
+            picked += [("q", i) for i in sorted(QSEL[n]) if ("q", i) not in picked]
+        select[n] = {"keys": picked, "content": content.get(n, set())}
     fixture_only = all(not (p.endswith(".py")) for p in changes) and bool(changes)
     return {"fixture_only": fixture_only, "static": static, "verify": cand, "changes": changes, "note": "; ".join(notes), "select": select,
-            "spans": list(SPANS), "full": FULL[0], "import_check": list(IMPORT_CHECK)}
+            "spans": list(SPANS), "full": FULL[0], "import_check": list(IMPORT_CHECK), "broad": BROAD[0]}
 
 
 CASE_KEYS = {}
 MAP_INDEX = {}
+MAP_INDEX_ANY = {}
 EXEC = {"common": {}, "tests": 0}
+IDS = []
 MAPREF = [None]
 
 
@@ -631,6 +747,26 @@ OVH = float(os.environ.get("BR_OVH", "0.3"))       # scorer CPU of one verificat
 Q_CODE = float(os.environ.get("BR_Q_CODE", "0.35"))  # chance a code change breaks nothing it reaches
 Q_FIXTURE = float(os.environ.get("BR_Q_FIXTURE", "0.05"))
 INPROC = {}
+TPCDS = [None]
+
+
+def _tpcds_evidence(p, others):
+    """How many other reached tests run the changed lines that TPC-DS runs (definition changes: all others)."""
+    if not p["spans"]:
+        return len(others)
+    M = MAPREF[0]
+    tp_map = MAP_INDEX_ANY.get(TPCDS[0])
+    if tp_map is None:
+        return 0
+    acc = 0
+    for path, s, e in p["spans"]:
+        rt = M.rt(path)
+        for ln in range(s, e + 1):
+            b = rt.get(ln, 0)
+            if b >> tp_map & 1:
+                acc |= b & ~(1 << tp_map)
+    acc = M.conv(acc)
+    return sum(1 for n in others if acc >> n & 1)
 CASE_CPU = {}
 CASE_POS = {}
 
@@ -679,10 +815,22 @@ def verify(plans, dotted, secs, ids):
                     cost = cost * max(k, 0.5) / total
                 filters[dotted[n]] = sel
             est[n] = cost
+        if p.get("broad"):
+            p["static"] |= v
+            log(f"{c}: broad module-level change, including every candidate")
+            continue
         q = Q_FIXTURE if p.get("fixture_only") else Q_CODE
         # tests far cheaper to run than to include: always run them
         forced = [n for n in nums if est[n] < 0.6 * secs[n] - 0.05 and est[n] < 8]
         optional = [n for n in nums if n not in forced]
+        # TPC-DS through the executor (21 s) is left out when every other reached test runs and passes and
+        # enough of them cover the same lines; measured on 40 mutants of lines it shares: it never failed alone.
+        cond = None
+        if TPCDS[0] is not None and TPCDS[0] in optional and os.environ.get("BR_TPCDS_RULE", "1") == "1":
+            others = [n for n in nums if n != TPCDS[0]]
+            if len(others) >= 3 and _tpcds_evidence(p, others) >= 3 and sum(est[n] for n in others) < 30:
+                cond = TPCDS[0]
+                optional.remove(cond)
         # likely failures first: tests reached through a hit fixture case or named after the changed module
         stems = {os.path.splitext(os.path.basename(f))[0] for f in (p["changes"] or {})}
         def order(n):
@@ -693,7 +841,9 @@ def verify(plans, dotted, secs, ids):
         optional.sort(key=order)
         ovh = 0.0 if forced else OVH
         verify_opt = False
-        if optional and p["changes"] is not None and VERIFY:
+        if cond is not None and p["changes"] is not None and VERIFY:
+            verify_opt = bool(optional) or bool(forced)  # running the others may save the 21 s test
+        elif optional and p["changes"] is not None and VERIFY:
             s_opt = pack_cost(optional, secs)
             c1 = est[optional[0]]
             lhs = sum(est[n] for n in optional) + ovh + ((1 - q) / max(q, 0.01)) * (c1 + ovh)
@@ -703,7 +853,13 @@ def verify(plans, dotted, secs, ids):
         run = sorted(forced, key=lambda n: est[n]) + (optional if verify_opt else [])
         if not verify_opt:
             p["static"] |= sum(1 << n for n in optional)
+            if cond is not None:
+                p["static"] |= 1 << cond
+                cond = None
+        p["cond"] = cond
         if not run and not p.get("import_check"):
+            if p.get("cond") is not None:
+                p["static"] |= 1 << p["cond"]
             continue
         if not VERIFY or p["changes"] is None:
             p["static"] |= sum(1 << n for n in run)
@@ -714,10 +870,12 @@ def verify(plans, dotted, secs, ids):
         except Exception as e:
             log(f"{c}: overlay failed ({e}); including candidates")
             p["static"] |= sum(1 << n for n in run)
+            if p.get("cond") is not None:
+                p["static"] |= 1 << p["cond"]
             continue
-        timeouts = {dotted[n]: max(3.0, 5 * secs[n] + 2) for n in run}
-        budget = 10 + sum(timeouts.values())
-        cap = 600 if os.environ.get("BR_EXACT") == "1" else 90
+        timeouts = {dotted[n]: max(6.0, 8 * secs[n] + 4) for n in run}
+        budget = 15 + sum(timeouts.values())
+        cap = 600 if os.environ.get("BR_EXACT") == "1" else 120
         j = runner.Job(c, root, [dotted[n] for n in run], timeouts, min(budget, cap))
         j.import_check = [m for m, _ in p.get("import_check", [])]
         j.import_paths = {m: path for m, path in p.get("import_check", [])}
@@ -744,6 +902,12 @@ def verify(plans, dotted, secs, ids):
     for j in jobs:
         bad = j.failing()
         results[j.key] = sum(1 << back[d] for d in bad if d in back)
+        cond = plans[j.key].get("cond")
+        if cond is not None:
+            clean = j.ended and not j.stop_now and not bad and not j.impfail and len(j.done) == len(j.tests)
+            if not clean:
+                results[j.key] |= 1 << cond
+            log(f"{j.key}: TPC-DS {'left out (every other reached test passed)' if clean else 'included'}")
         if j.impfail or (j.import_check and not j.import_ok and not j.ended):
             # a changed module did not import (or the check never finished): every importer fails
             extra = 0

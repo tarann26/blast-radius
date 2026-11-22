@@ -48,9 +48,14 @@ for i, t in enumerate(tests):
                 tm = cases_by_file.setdefault(f, {}).setdefault(i, {})
                 for ln in lines:
                     tm[ln] = tm.get(ln, 0) | (1 << ci)
+    test_src = open(os.path.join(REPO, t["file"])).read()
+    reads_files = any(s in test_src for s in ("read_text", "open(", "runpy", "getsource", "linecache"))
     for f in d["opens"]:
-        if not (f.endswith(".pyc") or "__pycache__" in f):
-            opens[f] = opens.get(f, 0) | b
+        if f.endswith(".pyc") or "__pycache__" in f:
+            continue
+        if f.endswith(".py") and not reads_files:
+            continue  # an import recompiling a stale cache, not a test reading source text
+        opens[f] = opens.get(f, 0) | b
     if d["spawn"]:
         spawn |= b
     for k in d.get("classes", ()):
